@@ -763,6 +763,93 @@ impl From<PolychromeSprite> for Primitive {
     }
 }
 
+/// Receives drawable presentation observations independently of GPU slot leases.
+pub trait TexturePresentationObserver: Debug + Send + Sync {
+    /// Called after a drawable is displayed; `seconds` uses the platform's
+    /// presentation clock (Metal: `presentedTime`).
+    fn presented(&self, seconds: f64);
+}
+
+/// Told when renderer GPU work that sampled a color texture has completed.
+pub trait TextureConsumptionObserver: Debug + Send + Sync {
+    /// Called once per renderer submission that sampled the texture, after
+    /// that submission's GPU work completed (not when it was presented).
+    fn consumed(&self);
+}
+
+/// Immutable, ready premultiplied color texture, retained until GPU completion.
+///
+/// The payload is opaque to the scene: each platform renderer accepts the
+/// payload types it can sample (for example `metal::Texture` on macOS) and
+/// rejects any other. Renderers keep the `Arc<ColorTexture>` - and with it
+/// the producer's lease - until every GPU submission that sampled it has
+/// completed, even if the scene or window is released first.
+#[derive(Debug)]
+pub struct ColorTexture {
+    payload: Box<dyn std::any::Any + Send + Sync>,
+    _lease: std::sync::Arc<dyn Debug + Send + Sync>,
+    observer: Option<std::sync::Arc<dyn TexturePresentationObserver>>,
+    consumer: Option<std::sync::Arc<dyn TextureConsumptionObserver>>,
+}
+
+impl ColorTexture {
+    /// Wrap a completed producer frame without CPU image conversion.
+    ///
+    /// # Safety
+    /// Producer GPU work must be complete, or ordered before any consumer use
+    /// by synchronization the payload itself carries. The texture must remain
+    /// immutable until the last lease is dropped, including every consumer
+    /// GPU use. Pixels are premultiplied, top-left-origin BGRA8/RGBA8 in this
+    /// experiment, on the device of the window that paints it.
+    pub unsafe fn from_ready_payload<P: std::any::Any + Send + Sync>(
+        payload: P,
+        lease: std::sync::Arc<dyn Debug + Send + Sync>,
+    ) -> Self {
+        Self {
+            payload: Box::new(payload),
+            _lease: lease,
+            observer: None,
+            consumer: None,
+        }
+    }
+
+    /// The platform payload, when it is of type `P`.
+    pub fn payload<P: std::any::Any>(&self) -> Option<&P> {
+        self.payload.downcast_ref::<P>()
+    }
+
+    /// Attach frame metadata measurement without extending the GPU slot lease.
+    pub fn with_presentation_observer(
+        mut self,
+        observer: std::sync::Arc<dyn TexturePresentationObserver>,
+    ) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Separate observer clone; it must not retain the mutable producer slot.
+    pub fn presentation_observer(&self) -> Option<std::sync::Arc<dyn TexturePresentationObserver>> {
+        self.observer.clone()
+    }
+
+    /// Attach a consumer-completion observer; it does not extend the lease.
+    pub fn with_consumption_observer(
+        mut self,
+        observer: std::sync::Arc<dyn TextureConsumptionObserver>,
+    ) -> Self {
+        self.consumer = Some(observer);
+        self
+    }
+
+    /// Renderer hook: the GPU work of one submission that sampled this
+    /// texture has completed.
+    pub fn notify_consumed(&self) {
+        if let Some(consumer) = &self.consumer {
+            consumer.consumed();
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
 pub struct PaintSurface {
@@ -770,7 +857,8 @@ pub struct PaintSurface {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(target_os = "macos")]
-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    pub image_buffer: Option<core_video::pixel_buffer::CVPixelBuffer>,
+    pub color_texture: Option<std::sync::Arc<ColorTexture>>,
 }
 
 impl From<PaintSurface> for Primitive {

@@ -4632,7 +4632,30 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            image_buffer,
+            image_buffer: Some(image_buffer),
+            color_texture: None,
+        });
+    }
+
+    /// Paint an external color texture at the current scene order and clip.
+    /// This is separate from the NV12 video surface path. Only renderers
+    /// that sample the payload's type draw it (the Metal renderer; Windows
+    /// does not yet), and none substitutes a CPU copy.
+    pub fn paint_color_texture(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        texture: Arc<crate::ColorTexture>,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(crate::PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            #[cfg(target_os = "macos")]
+            image_buffer: None,
+            color_texture: Some(texture),
         });
     }
 
