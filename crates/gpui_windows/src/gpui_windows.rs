@@ -1,6 +1,7 @@
 #![cfg(target_os = "windows")]
 
 mod clipboard;
+mod color_surfaces;
 mod destination_list;
 mod direct_manipulation;
 mod direct_write;

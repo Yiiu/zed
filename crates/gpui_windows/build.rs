@@ -38,6 +38,7 @@ mod shader_compilation {
             "monochrome_sprite",
             "subpixel_sprite",
             "polychrome_sprite",
+            "color_surface",
         ];
 
         let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);

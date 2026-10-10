@@ -1011,6 +1011,10 @@ impl PlatformWindow for WindowsWindow {
         self.state.renderer.borrow().gpu_specs().log_err()
     }
 
+    fn d3d11_device(&self) -> Option<D3D11DeviceInfo> {
+        self.state.renderer.borrow().d3d11_device()
+    }
+
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let scale_factor = self.state.scale_factor.get();
         let caret_position = POINT {

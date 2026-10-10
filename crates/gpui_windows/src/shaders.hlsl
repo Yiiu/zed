@@ -1266,3 +1266,42 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }
+
+/*
+**
+**              Color surfaces (external premultiplied textures)
+**
+*/
+
+struct ColorSurface {
+    Bounds bounds;
+    Bounds content_mask;
+};
+
+struct ColorSurfaceVertexOutput {
+    float4 position: SV_Position;
+    float2 texture_coords: TEXCOORD0;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct ColorSurfaceFragmentInput {
+    float4 position: SV_Position;
+    float2 texture_coords: TEXCOORD0;
+};
+
+StructuredBuffer<ColorSurface> color_surfaces: register(t1);
+
+ColorSurfaceVertexOutput color_surface_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    ColorSurface surface = color_surfaces[instance_id];
+
+    ColorSurfaceVertexOutput output;
+    output.position = to_device_position(unit_vertex, surface.bounds);
+    output.texture_coords = unit_vertex;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds, surface.content_mask);
+    return output;
+}
+
+float4 color_surface_fragment(ColorSurfaceFragmentInput input): SV_Target {
+    return t_sprite.Sample(s_sprite, input.texture_coords);
+}

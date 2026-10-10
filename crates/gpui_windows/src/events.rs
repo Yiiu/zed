@@ -1332,6 +1332,7 @@ impl WindowsWindowInner {
             require_presentation: false,
             force_render,
         });
+        self.state.renderer.borrow_mut().poll_color_textures();
 
         self.state.callbacks.request_frame.set(Some(request_frame));
         self.update_ime_enabled(handle);

@@ -6249,6 +6249,13 @@ impl Window {
         }
     }
 
+    /// Exact D3D11 device and adapter used to render this window; no
+    /// system-default substitution.
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_device(&self) -> Option<crate::D3D11DeviceInfo> {
+        self.platform_window.d3d11_device()
+    }
+
     /// Read information about the GPU backing this window.
     /// Currently returns None on Mac and Windows.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {

@@ -49,6 +49,14 @@ pub(crate) struct DirectXRenderer {
     width: u32,
     height: u32,
 
+    /// Colour textures sampled by the frame being drawn.
+    frame_textures: Vec<Arc<ColorTexture>>,
+    /// Leases held until the GPU has consumed their textures.
+    retirement: crate::color_surfaces::ColorRetirement,
+    /// Presents awaiting DXGI frame statistics.
+    presentations: crate::color_surfaces::Presentations,
+    present_log: crate::color_surfaces::PresentLog,
+
     /// Whether we want to skip drwaing due to device lost events.
     ///
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
@@ -70,6 +78,8 @@ pub(crate) struct DirectXRendererDevices {
 struct DirectXResources {
     // Direct3D rendering objects
     swap_chain: IDXGISwapChain1,
+    /// Frame-latency waitable object (`GPUI_PRESENT_MODE=waitable` only).
+    latency_wait: Option<crate::color_surfaces::CloseOnDrop>,
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
@@ -84,6 +94,7 @@ struct DirectXResources {
 }
 
 struct DirectXRenderPipelines {
+    color_surfaces: PipelineState<crate::color_surfaces::ColorSurfaceInstance>,
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
@@ -98,6 +109,8 @@ struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     batch_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+    /// Edge-clamped: an external texture is drawn exactly once, never tiled.
+    clamp_sampler: Option<ID3D11SamplerState>,
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -182,7 +195,17 @@ impl DirectXRenderer {
             Some(composition)
         };
 
+        let retirement =
+            crate::color_surfaces::ColorRetirement::new(&devices.device, &devices.device_context);
+        log::info!(
+            "external colour textures retire through {}",
+            if retirement.uses_fence() { "a D3D11 fence" } else { "event queries" }
+        );
         Ok(DirectXRenderer {
+            frame_textures: Vec::new(),
+            retirement,
+            presentations: crate::color_surfaces::Presentations::new(),
+            present_log: crate::color_surfaces::PresentLog::new(),
             hwnd,
             atlas,
             devices: Some(devices),
@@ -243,13 +266,14 @@ impl DirectXRenderer {
 
     #[inline]
     fn present(&mut self) -> Result<()> {
-        let result = unsafe {
-            self.resources
-                .as_ref()
-                .expect("resources missing")
-                .swap_chain
-                .Present(0, DXGI_PRESENT(0))
+        let sync_interval = match crate::color_surfaces::present_mode() {
+            crate::color_surfaces::PresentMode::Interval0 => 0,
+            _ => 1,
         };
+        let resources = self.resources.as_ref().expect("resources missing");
+        // SAFETY: the renderer's own swap chain, presented on the UI thread.
+        let result = unsafe { resources.swap_chain.Present(sync_interval, DXGI_PRESENT(0)) };
+        self.present_log.presented(&resources.swap_chain);
         result.ok().context("Presenting swap chain failed")
     }
 
@@ -312,6 +336,13 @@ impl DirectXRenderer {
 
         self.atlas
             .handle_device_lost(&devices.device, &devices.device_context);
+        // Textures of the old device can never be sampled again: release
+        // their leases now and retire later ones through the new device.
+        self.frame_textures.clear();
+        self.retirement.clear();
+        self.retirement =
+            crate::color_surfaces::ColorRetirement::new(&devices.device, &devices.device_context);
+        self.presentations.clear();
 
         unsafe {
             devices
@@ -337,8 +368,98 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
-        self.render(scene, background_appearance)?;
-        self.present()
+        if let Some(wait) = self.resources.as_ref().and_then(|resources| resources.latency_wait.as_ref()) {
+            // SAFETY: the swap chain's own waitable object, owned by `resources`.
+            unsafe {
+                windows::Win32::System::Threading::WaitForSingleObjectEx(wait.0, 100, true);
+            }
+        }
+        let rendered = self.render(scene, background_appearance);
+        let textures = std::mem::take(&mut self.frame_textures);
+        let observers: Vec<_> = textures
+            .iter()
+            .filter_map(|texture| {
+                let source = texture
+                    .payload::<D3D11ColorPayload>()
+                    .map(D3D11ColorPayload::presentation_source_cell);
+                texture
+                    .presentation_observer()
+                    .map(|observer| (observer, source))
+            })
+            .collect();
+        let presented = rendered.and_then(|()| self.present());
+        if let (Some(devices), Some(resources)) = (self.devices.as_ref(), self.resources.as_ref()) {
+            if presented.is_ok() {
+                self.presentations.presented(&resources.swap_chain, observers);
+            }
+            // Signalled after the present: the fence completes once every
+            // command that sampled these textures has executed.
+            self.retirement
+                .submit(&devices.device, &devices.device_context, textures);
+        }
+        presented
+    }
+
+    /// Exact device and adapter LUID, for same-device texture producers.
+    pub(crate) fn d3d11_device(&self) -> Option<D3D11DeviceInfo> {
+        let devices = self.devices.as_ref()?;
+        // SAFETY: the renderer's own live adapter; a plain description query.
+        let description = unsafe { devices.adapter.GetDesc1() }.ok()?;
+        let mut adapter_luid = [0_u8; 8];
+        adapter_luid[..4].copy_from_slice(&description.AdapterLuid.LowPart.to_le_bytes());
+        adapter_luid[4..].copy_from_slice(&description.AdapterLuid.HighPart.to_le_bytes());
+        Some(D3D11DeviceInfo {
+            device: devices.device.clone(),
+            adapter_luid,
+        })
+    }
+
+    /// Each vsync tick, drawn or not: report presents the display has shown
+    /// and (without a fence) retire textures whose GPU work completed.
+    pub(crate) fn poll_color_textures(&mut self) {
+        if let (Some(devices), Some(resources)) = (self.devices.as_ref(), self.resources.as_ref()) {
+            self.presentations.poll(&resources.swap_chain);
+            self.present_log.sample(&resources.swap_chain);
+            self.retirement.poll(&devices.device_context);
+        }
+    }
+
+    /// Runs the pending uploads of the colour textures `scene` samples, on
+    /// the immediate context, before any state for this frame is set.
+    fn execute_color_uploads(&self, scene: &Scene) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        for surface in &scene.surfaces {
+            let Some(payload) = surface
+                .color_texture
+                .as_ref()
+                .and_then(|texture| texture.payload::<D3D11ColorPayload>())
+            else {
+                continue;
+            };
+            if let Some(upload) = payload.take_upload() {
+                let started = std::time::Instant::now();
+                // SAFETY: a list the producer recorded on a deferred context of
+                // this same device; executed once (taken), on the UI thread's
+                // immediate context, before anything samples its texture.
+                unsafe { devices.device_context.ExecuteCommandList(&upload, false) };
+                payload.record_execute(started.elapsed().as_micros() as u64);
+            }
+            if let Some((fence, value)) = payload.take_ready() {
+                // A shared-texture producer (Vulkan) signals `value` once its
+                // copy lands: the GPU waits before any sampling below.
+                let context = devices
+                    .device_context
+                    .cast::<windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4>()
+                    .context("external colour texture needs ID3D11DeviceContext4")?;
+                let started = std::time::Instant::now();
+                // SAFETY: a fence of this device (the producer's shared fence);
+                // a GPU-side wait queued before any sampling, never a CPU wait.
+                unsafe { context.Wait(&fence, value) }
+                    .context("queue wait for an external colour texture")?;
+                payload.record_execute(started.elapsed().as_micros() as u64);
+            }
+        }
+        Ok(())
     }
 
     /// Clear the render target for `background_appearance` and encode every
@@ -351,6 +472,7 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
+        self.execute_color_uploads(scene)?;
         self.pre_draw(&match background_appearance {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
@@ -510,7 +632,7 @@ impl DirectXRenderer {
                     width,
                     height,
                     RENDER_TARGET_FORMAT,
-                    DXGI_SWAP_CHAIN_FLAG(0),
+                    swap_chain_flags(),
                 )
                 .context("Failed to resize swap chain")?;
         }
@@ -811,6 +933,36 @@ impl DirectXRenderer {
         if surfaces.is_empty() {
             return Ok(());
         }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        for surface in surfaces {
+            let Some(color) = &surface.color_texture else {
+                continue;
+            };
+            let payload = color
+                .payload::<D3D11ColorPayload>()
+                .context("external color texture payload is not a D3D11 texture")?;
+            // SAFETY: a live texture held by the payload; a plain query.
+            let texture_device = unsafe { payload.texture().GetDevice() }?;
+            anyhow::ensure!(
+                texture_device.as_raw() == devices.device.as_raw(),
+                "external color texture device mismatch"
+            );
+            self.pipelines.color_surfaces.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &[crate::color_surfaces::ColorSurfaceInstance {
+                    bounds: surface.bounds,
+                    content_mask: surface.content_mask.bounds,
+                }],
+            )?;
+            self.pipelines.color_surfaces.draw_with_texture(
+                &devices.device_context,
+                &[Some(payload.view().clone())],
+                slice::from_ref(&self.globals.clamp_sampler),
+                1,
+            )?;
+            self.frame_textures.push(color.clone());
+        }
         Ok(())
     }
 
@@ -894,8 +1046,10 @@ impl DirectXResources {
         ) = create_resources(devices, &swap_chain, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
+        let latency_wait = latency_wait(&swap_chain);
         Ok(Self {
             swap_chain,
+            latency_wait,
             render_target: Some(render_target),
             render_target_view,
             path_intermediate_texture,
@@ -935,6 +1089,13 @@ impl DirectXResources {
 
 impl DirectXRenderPipelines {
     pub fn new(device: &ID3D11Device) -> Result<Self> {
+        let color_surfaces = PipelineState::new(
+            device,
+            "color_surface_pipeline",
+            ShaderModule::ColorSurface,
+            1,
+            create_blend_state_for_path_sprite(device)?,
+        )?;
         let shadow_pipeline = PipelineState::new(
             device,
             "shadow_pipeline",
@@ -993,6 +1154,7 @@ impl DirectXRenderPipelines {
         )?;
 
         Ok(Self {
+            color_surfaces,
             shadow_pipeline,
             quad_pipeline,
             path_rasterization_pipeline,
@@ -1051,10 +1213,30 @@ impl DirectXGlobalElements {
             output
         };
 
+        // SAFETY: a plain sampler description on the renderer's own device.
+        let clamp_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
+
         Ok(Self {
             global_params_buffer,
             batch_params_buffer,
             sampler,
+            clamp_sampler,
         })
     }
 }
@@ -1289,6 +1471,30 @@ fn get_comp_device(dxgi_device: &IDXGIDevice) -> Result<IDCompositionDevice> {
     Ok(unsafe { DCompositionCreateDevice(dxgi_device)? })
 }
 
+/// `GPUI_PRESENT_MODE=waitable` creates the swap chain with a frame-latency
+/// waitable object; every other mode keeps today's flags.
+fn swap_chain_flags() -> DXGI_SWAP_CHAIN_FLAG {
+    if crate::color_surfaces::present_mode() == crate::color_surfaces::PresentMode::Waitable {
+        DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+    } else {
+        DXGI_SWAP_CHAIN_FLAG(0)
+    }
+}
+
+/// The waitable object of a swap chain created with it, at maximum frame
+/// latency 1.
+fn latency_wait(swap_chain: &IDXGISwapChain1) -> Option<crate::color_surfaces::CloseOnDrop> {
+    if crate::color_surfaces::present_mode() != crate::color_surfaces::PresentMode::Waitable {
+        return None;
+    }
+    let swap_chain2 = swap_chain.cast::<IDXGISwapChain2>().ok()?;
+    // SAFETY: a swap chain created with the waitable-object flag.
+    unsafe {
+        swap_chain2.SetMaximumFrameLatency(1).ok()?;
+        Some(crate::color_surfaces::CloseOnDrop(swap_chain2.GetFrameLatencyWaitableObject()))
+    }
+}
+
 fn create_swap_chain_for_composition(
     dxgi_factory: &IDXGIFactory6,
     device: &ID3D11Device,
@@ -1310,7 +1516,7 @@ fn create_swap_chain_for_composition(
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
         AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-        Flags: 0,
+        Flags: swap_chain_flags().0 as u32,
     };
     Ok(unsafe { dxgi_factory.CreateSwapChainForComposition(device, &desc, None)? })
 }
@@ -1338,7 +1544,7 @@ fn create_swap_chain(
         Scaling: DXGI_SCALING_NONE,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
         AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-        Flags: 0,
+        Flags: swap_chain_flags().0 as u32,
     };
     let swap_chain =
         unsafe { dxgi_factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None) }?;
@@ -1711,6 +1917,7 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         EmojiRasterization,
+        ColorSurface,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1787,6 +1994,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
                     ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
+                },
+                ShaderModule::ColorSurface => match target {
+                    ShaderTarget::Vertex => COLOR_SURFACE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => COLOR_SURFACE_FRAGMENT_BYTES,
                 },
             };
             Self { inner: bytes }
@@ -1875,6 +2086,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
+                ShaderModule::ColorSurface => "color_surface",
             }
         }
     }

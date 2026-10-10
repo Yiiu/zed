@@ -820,6 +820,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         None
     }
 
+    /// Exact D3D11 device and adapter this window renders with, on Windows.
+    #[cfg(target_os = "windows")]
+    fn d3d11_device(&self) -> Option<crate::D3D11DeviceInfo> {
+        None
+    }
+
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
     fn window_bounds(&self) -> WindowBounds;

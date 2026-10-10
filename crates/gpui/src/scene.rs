@@ -883,6 +883,147 @@ impl ColorTexture {
     }
 }
 
+/// The D3D11 device a Windows window renders with, and its adapter.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone)]
+pub struct D3D11DeviceInfo {
+    /// The window's device: a colour texture it samples must live on it.
+    pub device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    /// The adapter's LUID, laid out as `LUID` (low part, then high part,
+    /// little-endian): the byte order of Vulkan's `deviceLUID`.
+    pub adapter_luid: [u8; 8],
+}
+
+/// Windows payload of a [`ColorTexture`]: a premultiplied BGRA8/RGBA8 2D
+/// texture with its shader view on the window's device, and optionally the
+/// command list that uploads its pixels, or the fence value a producer on
+/// another API (Vulkan, through a shared texture) signals once the pixels
+/// are written. The renderer executes the upload, or queues a GPU-side wait
+/// for the fence value, on its immediate context once, before the first
+/// frame that samples the texture.
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub struct D3D11ColorPayload {
+    texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    upload: std::sync::Mutex<Option<windows::Win32::Graphics::Direct3D11::ID3D11CommandList>>,
+    ready: std::sync::Mutex<Option<(windows::Win32::Graphics::Direct3D11::ID3D11Fence, u64)>>,
+    execute_micros: std::sync::atomic::AtomicU64,
+    presentation_source: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// How the Windows renderer learned that a frame was shown.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentationSource {
+    /// DXGI frame statistics counted this present as displayed.
+    Statistics = 1,
+    /// DWM's next-composition time, after the present.
+    Composition = 2,
+    /// Neither advances on this display (remote or virtual displays): the
+    /// present time plus one refresh period, an estimate.
+    Estimated = 3,
+}
+
+#[cfg(target_os = "windows")]
+impl PresentationSource {
+    /// Stable name for diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Statistics => "dxgi-statistics",
+            Self::Composition => "dwm-composition",
+            Self::Estimated => "estimated",
+        }
+    }
+
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Statistics),
+            2 => Some(Self::Composition),
+            3 => Some(Self::Estimated),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl D3D11ColorPayload {
+    /// Wraps a texture, its view and its pending upload, if any.
+    pub fn new(
+        texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+        upload: Option<windows::Win32::Graphics::Direct3D11::ID3D11CommandList>,
+    ) -> Self {
+        Self {
+            texture,
+            view,
+            upload: std::sync::Mutex::new(upload),
+            ready: std::sync::Mutex::new(None),
+            execute_micros: std::sync::atomic::AtomicU64::new(u64::MAX),
+            presentation_source: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        }
+    }
+
+    /// Where the renderer records how this texture's presentation was
+    /// detected (shared with the renderer, which does not keep the texture).
+    pub fn presentation_source_cell(&self) -> std::sync::Arc<std::sync::atomic::AtomicU8> {
+        self.presentation_source.clone()
+    }
+
+    /// How this texture's presentation was detected, once it was reported.
+    pub fn presentation_source(&self) -> Option<PresentationSource> {
+        PresentationSource::from_u8(
+            self.presentation_source
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// The pixels are complete once `fence` (on the window's device)
+    /// reaches `value`; the renderer waits for it on the GPU, not the CPU.
+    pub fn with_ready_fence(
+        self,
+        fence: windows::Win32::Graphics::Direct3D11::ID3D11Fence,
+        value: u64,
+    ) -> Self {
+        if let Ok(mut ready) = self.ready.lock() {
+            *ready = Some((fence, value));
+        }
+        self
+    }
+
+    /// The pending producer fence wait, taken once by the renderer.
+    pub fn take_ready(&self) -> Option<(windows::Win32::Graphics::Direct3D11::ID3D11Fence, u64)> {
+        self.ready.lock().ok().and_then(|mut ready| ready.take())
+    }
+
+    /// The texture.
+    pub fn texture(&self) -> &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D {
+        &self.texture
+    }
+
+    /// Its shader resource view.
+    pub fn view(&self) -> &windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView {
+        &self.view
+    }
+
+    /// The pending upload, taken once by the renderer.
+    pub fn take_upload(&self) -> Option<windows::Win32::Graphics::Direct3D11::ID3D11CommandList> {
+        self.upload.lock().ok().and_then(|mut upload| upload.take())
+    }
+
+    /// Records how long executing the upload took on the UI thread.
+    pub fn record_execute(&self, micros: u64) {
+        self.execute_micros
+            .store(micros, std::sync::atomic::Ordering::Release);
+    }
+
+    /// How long executing the upload took, once it ran.
+    pub fn execute_micros(&self) -> Option<u64> {
+        let micros = self.execute_micros.load(std::sync::atomic::Ordering::Acquire);
+        (micros != u64::MAX).then_some(micros)
+    }
+}
+
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
 pub struct PaintSurface {
