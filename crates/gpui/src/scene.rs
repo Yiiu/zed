@@ -850,6 +850,39 @@ impl ColorTexture {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl ColorTexture {
+    /// Wrap a completed Metal producer frame without CPU image conversion.
+    ///
+    /// # Safety
+    /// Producer GPU work must be complete. The texture must remain immutable
+    /// until the last lease is dropped, including every consumer GPU use.
+    /// Pixels are premultiplied, top-left-origin BGRA8/RGBA8 in this experiment.
+    pub unsafe fn from_ready_metal_texture(
+        texture: metal::Texture,
+        lease: std::sync::Arc<dyn Debug + Send + Sync>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            matches!(
+                texture.pixel_format(),
+                metal::MTLPixelFormat::BGRA8Unorm | metal::MTLPixelFormat::RGBA8Unorm
+            ) && texture.texture_type() == metal::MTLTextureType::D2
+                && texture.sample_count() == 1
+                && texture.usage().contains(metal::MTLTextureUsage::ShaderRead),
+            "unsupported color texture descriptor"
+        );
+        // SAFETY: the caller upholds this constructor's contract, which is
+        // the neutral constructor's contract specialised to Metal.
+        Ok(unsafe { Self::from_ready_payload(texture, lease) })
+    }
+
+    /// The retained Metal texture, if this is a Metal payload; writing
+    /// requires the constructor's contract.
+    pub fn metal_texture(&self) -> Option<&metal::TextureRef> {
+        self.payload::<metal::Texture>().map(|texture| &**texture)
+    }
+}
+
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
 pub struct PaintSurface {

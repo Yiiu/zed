@@ -2639,6 +2639,13 @@ impl Window {
     /// The scale factor of the display associated with the window. For example, it could
     /// return 2.0 for a "retina" display, indicating that each logical pixel should actually
     /// be rendered as two pixels on screen.
+    /// Exact device used to render this window; no system-default substitution.
+    #[cfg(target_os = "macos")]
+    pub fn metal_device(&self) -> Option<metal::Device> {
+        self.platform_window.metal_device()
+    }
+
+    /// Device pixels per logical pixel of this window.
     pub fn scale_factor(&self) -> f32 {
         self.scale_factor
     }

@@ -814,6 +814,12 @@ pub enum TextInputStateChange {
 
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+    /// Exact window renderer device, when this platform renders through Metal.
+    #[cfg(target_os = "macos")]
+    fn metal_device(&self) -> Option<metal::Device> {
+        None
+    }
+
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
     fn window_bounds(&self) -> WindowBounds;

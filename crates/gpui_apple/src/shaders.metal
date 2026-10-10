@@ -881,6 +881,13 @@ vertex SurfaceVertexOutput surface_vertex(
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+fragment float4 color_surface_fragment(
+    SurfaceFragmentInput input [[stage_in]],
+    texture2d<float> color_texture [[texture(SurfaceInputIndex_YTexture)]]) {
+  constexpr sampler color_sampler(mag_filter::linear, min_filter::linear);
+  return color_texture.sample(color_sampler, input.texture_position);
+}
+
 fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],

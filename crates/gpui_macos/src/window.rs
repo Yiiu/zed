@@ -1337,6 +1337,10 @@ fn if_window_not_closed(closed: Arc<AtomicBool>, f: impl FnOnce()) {
 }
 
 impl PlatformWindow for MacWindow {
+    fn metal_device(&self) -> Option<metal::Device> {
+        Some(self.0.lock().renderer.device())
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.0.as_ref().lock().bounds()
     }

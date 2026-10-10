@@ -126,6 +126,7 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    color_surfaces_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -184,6 +185,11 @@ impl MetalRenderer {
     pub fn new_headless(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>) -> Self {
         let device = Self::create_device();
         Self::new_internal(device, None, true, instance_buffer_pool)
+    }
+
+    /// Exact renderer device for same-device native interoperability.
+    pub fn device(&self) -> metal::Device {
+        self.device.clone()
     }
 
     fn create_device() -> metal::Device {
@@ -324,6 +330,8 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
 
+        let color_surfaces_pipeline_state = build_color_pipeline_state(&device, &library);
+
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
         let core_video_texture_cache =
@@ -345,6 +353,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            color_surfaces_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -477,6 +486,22 @@ impl MetalRenderer {
             }
         };
 
+        let observers = scene
+            .surfaces
+            .iter()
+            .filter_map(|surface| surface.color_texture.as_ref())
+            .filter_map(|texture| texture.presentation_observer())
+            .collect::<Vec<_>>();
+        if !observers.is_empty() {
+            let presented = ConcreteBlock::new(move |drawable: &metal::DrawableRef| {
+                for observer in &observers {
+                    observer.presented(drawable.presented_time());
+                }
+            })
+            .copy();
+            drawable.add_presented_handler(&presented);
+        }
+
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
@@ -518,11 +543,27 @@ impl MetalRenderer {
             viewport_size,
         )?;
 
+        // Scene/element release is not GPU completion. Keep slot leases alive
+        // even if the scene is immediately replaced or its window closes.
+        let color_frames = Cell::new(Some(
+            scene
+                .surfaces
+                .iter()
+                .filter_map(|surface| surface.color_texture.clone())
+                .collect::<Vec<_>>(),
+        ));
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
         let block = ConcreteBlock::new(move |_| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
+            }
+            // GPU work that sampled these textures is complete: tell each
+            // consumer, then release this submission's leases.
+            if let Some(frames) = color_frames.take() {
+                for frame in &frames {
+                    frame.notify_consumed();
+                }
             }
         });
         let block = block.copy();
@@ -615,6 +656,16 @@ impl MetalRenderer {
     /// inspected.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     pub fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<()> {
+        self.submit_scene(scene, size).map(|_| ())
+    }
+
+    /// Diagnostic submission handle: GPU completion is not presentation.
+    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+    pub fn submit_scene(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> Result<metal::CommandBuffer> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             anyhow::bail!("Invalid size for render_scene: {:?}", size);
         }
@@ -645,7 +696,7 @@ impl MetalRenderer {
         // Commit without waiting, mirroring presentation to a real window where
         // the CPU doesn't block on the GPU.
         command_buffer.commit();
-        Ok(())
+        Ok(command_buffer)
     }
 
     fn draw_primitives_to_texture(
@@ -730,7 +781,7 @@ impl MetalRenderer {
                     instance_bindings,
                     viewport_size,
                     command_encoder,
-                ),
+                )?,
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
@@ -1122,9 +1173,9 @@ impl MetalRenderer {
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
-    ) {
+    ) -> Result<()> {
         if surfaces.is_empty() {
-            return;
+            return Ok(());
         }
 
         command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
@@ -1145,35 +1196,60 @@ impl MetalRenderer {
         );
 
         for (index, surface) in surfaces.iter().enumerate() {
+            if let Some(color) = &surface.color_texture {
+                let texture = color
+                    .metal_texture()
+                    .context("external color texture payload is not a Metal texture")?;
+                anyhow::ensure!(
+                    texture.device().as_ptr() == self.device.as_ptr(),
+                    "external color texture device mismatch"
+                );
+                command_encoder.set_render_pipeline_state(&self.color_surfaces_pipeline_state);
+                command_encoder
+                    .set_fragment_texture(SurfaceInputIndex::YTexture as u64, Some(texture));
+                command_encoder.draw_primitives_instanced_base_instance(
+                    metal::MTLPrimitiveType::Triangle,
+                    0,
+                    6,
+                    1,
+                    (first_surface + index) as u64,
+                );
+                continue;
+            }
+            command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+            let image_buffer = surface
+                .image_buffer
+                .as_ref()
+                .context("surface has no resource")?;
             let texture_size = size(
-                DevicePixels::from(surface.image_buffer.get_width() as i32),
-                DevicePixels::from(surface.image_buffer.get_height() as i32),
+                DevicePixels::from(image_buffer.get_width() as i32),
+                DevicePixels::from(image_buffer.get_height() as i32),
             );
 
             assert_eq!(
-                surface.image_buffer.get_pixel_format(),
+                image_buffer.get_pixel_format(),
                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
             );
 
             let y_texture = self
                 .core_video_texture_cache
                 .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
+                    image_buffer.as_concrete_TypeRef(),
                     None,
                     MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
+                    image_buffer.get_width_of_plane(0),
+                    image_buffer.get_height_of_plane(0),
                     0,
                 )
                 .unwrap();
             let cb_cr_texture = self
                 .core_video_texture_cache
                 .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
+                    image_buffer.as_concrete_TypeRef(),
                     None,
                     MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
+                    image_buffer.get_width_of_plane(1),
+                    image_buffer.get_height_of_plane(1),
                     1,
                 )
                 .unwrap();
@@ -1201,6 +1277,7 @@ impl MetalRenderer {
                 (first_surface + index) as u64,
             );
         }
+        Ok(())
     }
 }
 
@@ -1264,6 +1341,35 @@ fn read_texture_to_image(texture: &metal::TextureRef) -> Result<RgbaImage> {
     }
 
     RgbaImage::from_raw(width, height, pixels).context("failed to create RgbaImage from pixel data")
+}
+
+fn build_color_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+) -> metal::RenderPipelineState {
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label("external_color_surfaces");
+    let vertex = library
+        .get_function("surface_vertex", None)
+        .expect("surface vertex");
+    let fragment = library
+        .get_function("color_surface_fragment", None)
+        .expect("color fragment");
+    descriptor.set_vertex_function(Some(&vertex));
+    descriptor.set_fragment_function(Some(&fragment));
+    let attachment = descriptor
+        .color_attachments()
+        .object_at(0)
+        .expect("color attachment");
+    attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+    attachment.set_blending_enabled(true);
+    attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
+    attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+    attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("color pipeline")
 }
 
 fn build_pipeline_state(
